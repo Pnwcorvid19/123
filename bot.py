@@ -115,4 +115,120 @@ async def fetch_strikes_command(update: Update, context: ContextTypes.DEFAULT_TY
         yes_str = f"${m['yes_price']:.2f}" if isinstance(m['yes_price'], (int, float)) else "N/A"
         msg += f"• **[{m['coin']}] {m['title']}**\n  Ticker: `{m['ticker']}`\n  Strike: **{strike_str}** | Yes: **{yes_str}**\n\n"
         
-    await update.message.reply_text(msg
+    await update.message.reply_text(msg)
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Fetching official CF Benchmarks & analyzing markets...")
+    markets = fetch_15m_crypto_markets()
+    if not markets:
+        await update.message.reply_text("⚠️ No active 15-minute markets found.")
+        return
+        
+    msg = "🧮 **15-Min Settlement Index & Prediction Analysis**\n\n"
+    cache = {}
+    
+    for m in markets[:6]:
+        coin = m['coin']
+        index_id = SERIES_MAPPING.get(coin, {}).get("index", "ETHUSD_RTI")
+        
+        if index_id not in cache:
+            cache[index_id] = get_cf_index(index_id)
+            
+        idx = cache[index_id] or {}
+        settlement_ref = idx.get('avg_60s') or idx.get('current')
+        
+        strike = m['strike']
+        yes_price = m['yes_price']
+        
+        insight = "⚖️ Market balanced"
+        if settlement_ref and isinstance(strike, (int, float)) and isinstance(yes_price, (int, float)):
+            diff = settlement_ref - strike
+            prob = int(yes_price * 100)
+            if settlement_ref > strike:
+                insight = f"✅ **ITM:** Index is +${diff:.2f} above strike ({prob}% Yes odds)" if prob >= 50 else f"🔥 **UNDERPRICED YES:** Index is +${diff:.2f} above strike, but Yes is only {prob}%!"
+            else:
+                insight = f"❌ **OTM:** Index is -${abs(diff):.2f} below strike ({prob}% Yes odds)" if prob < 50 else f"⚠️ **OVERPRICED YES:** Index is -${abs(diff):.2f} below strike, but Yes is {prob}%!"
+
+        ref_str = f"${settlement_ref:,.2f}" if settlement_ref else "Unavailable (Check API Keys)"
+        strike_str = f"${strike:,.2f}" if isinstance(strike, (int, float)) else "N/A"
+
+        msg += f"• **[{coin}] {m['title']}**\n  Target Strike: **{strike_str}**\n  CF Index (60s Avg): **{ref_str}**\n  Status: {insight}\n\n"
+
+    await update.message.reply_text(msg)
+
+# --- Background Worker ---
+
+async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    markets = fetch_15m_crypto_markets()
+    if not markets:
+        return
+
+    if "alerted" not in context.bot_data:
+        context.bot_data["alerted"] = set()
+
+    cache = {}
+    for m in markets:
+        coin = m['coin']
+        ticker = m['ticker']
+        strike = m['strike']
+        yes_price = m['yes_price']
+        
+        if not isinstance(strike, (int, float)) or not isinstance(yes_price, (int, float)):
+            continue
+
+        index_id = SERIES_MAPPING.get(coin, {}).get("index", "ETHUSD_RTI")
+        if index_id not in cache:
+            cache[index_id] = get_cf_index(index_id)
+            
+        idx = cache[index_id] or {}
+        settlement_ref = idx.get('avg_60s') or idx.get('current')
+        if not settlement_ref:
+            continue
+
+        diff = settlement_ref - strike
+        prob = int(yes_price * 100)
+
+        if settlement_ref > strike and prob <= 40:
+            key = f"{ticker}_UNDER"
+            if key not in context.bot_data["alerted"]:
+                context.bot_data["alerted"].add(key)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🔥 **MISPRICING ALERT [{coin}]** 🔥\n`{ticker}`\nStrike: ${strike:,.2f}\nIndex: ${settlement_ref:,.2f} (+${diff:.2f})\nYes Odds: {prob}%"
+                )
+
+async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+    context.job_queue.run_repeating(monitor_job, interval=20, first=1, chat_id=chat_id, name=str(chat_id))
+    await update.message.reply_text("🚨 **Live Background Alerts Enabled!**")
+
+async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    if not jobs:
+        await update.message.reply_text("ℹ️ No alerts running.")
+        return
+    for j in jobs:
+        j.schedule_removal()
+    await update.message.reply_text("🛑 **Alerts stopped.**")
+
+def main():
+    if not BOT_TOKEN:
+        raise ValueError("Missing BOT_TOKEN environment variable!")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("fetchstrikes", fetch_strikes_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("startalerts", start_alerts))
+    app.add_handler(CommandHandler("stopalerts", stop_alerts))
+
+    logger.info("Starting bot polling...")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
