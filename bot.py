@@ -3,6 +3,8 @@ import time
 import logging
 import datetime
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -30,9 +32,8 @@ SERIES_MAPPING = {
 # Cache for spot velocity tracking
 SPOT_HISTORY = {}
 
-# --- Render Port Binder ---
+# --- Render Port Binder (Satisfies Web Service Requirement) ---
 def run_dummy_web_server():
-    from http.server import HTTPServer, BaseHTTPRequestHandler
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -95,46 +96,14 @@ def fetch_15m_crypto_markets():
     return results
 
 def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
+    """Queries Kalshi's public order book using correct v2 orderbook_fp schema"""
     try:
         resp = requests.get(f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}/orderbook", timeout=2)
         if resp.status_code == 200:
-            data = resp.json().get("orderbook", {})
-            yes_orders = data.get("yes", [])
-            no_orders = data.get("no", [])
+            body = resp.json()
+            ob = body.get("orderbook_fp") or body.get("orderbook") or {}
+            yes_orders = ob.get("yes_dollars") or ob.get("yes") or []
+            no_orders = ob.get("no_dollars") or ob.get("no") or []
             
-            yes_volume = sum([o[1] for o in yes_orders if len(o) >= 2])
-            no_volume = sum([o[1] for o in no_orders if len(o) >= 2])
-            
-            total_vol = yes_volume + no_volume
-            ratio = (yes_volume / total_vol) if total_vol > 0 else 0.5
-            return {"yes_vol": yes_volume, "no_vol": no_volume, "ratio": ratio}
-    except Exception as e:
-        logger.error(f"Error fetching orderbook for {ticker}: {e}")
-    return {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
-
-def get_live_spot_price(coin: str):
-    current_price = None
-    
-    # 1. CoinGecko
-    try:
-        cg_ids = {
-            "ETH": "ethereum", "XRP": "ripple", "NEAR": "near",
-            "BTC": "bitcoin", "SOL": "solana", "BNB": "binancecoin",
-            "ZEC": "zcash", "HYPE": "hyperliquid"
-        }
-        cg_id = cg_ids.get(coin)
-        if cg_id:
-            resp = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=2)
-            if resp.status_code == 200:
-                val = resp.json().get(cg_id, {}).get("usd")
-                if val:
-                    current_price = float(val)
-    except Exception:
-        pass
-
-    # 2. Coinbase Fallback
-    if not current_price:
-        try:
-            cb_symbols = {
-                "ETH": "ETH-USD", "XRP": "XRP-USD", "NEAR": "NEAR-USD",
-                "BTC": "BTC-USD", "SOL": "SOL-USD", "BNB": "BNB
+            yes_volume = sum([float(o[1]) for o in yes_orders if len(o) >= 2])
+            no_volume
