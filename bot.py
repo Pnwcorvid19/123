@@ -3,7 +3,7 @@ import logging
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from kalshi_python_sync import KalshiClient
+from kalshi_python_sync import Configuration, KalshiClient
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,21 +13,21 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID")
 KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY")
 
-# Initialize Official Kalshi Client
+# Initialize Official Kalshi Client using Configuration object
+kalshi_client = None
 try:
     if KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PEM:
-        # Handle formatting if newlines were escaped as literal '\n' in Render env vars
         formatted_key = KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n")
-        kalshi_client = KalshiClient(
-            key_id=KALSHI_KEY_ID,
-            private_key=formatted_key,
-            environment="production"
-        )
-    else:
-        kalshi_client = None
+        
+        # Configure client connection
+        config = Configuration(host="https://external-api.kalshi.com/trade-api/v2")
+        config.api_key_id = KALSHI_KEY_ID
+        config.private_key_pem = formatted_key
+        
+        kalshi_client = KalshiClient(config)
+        logger.info("Kalshi client initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize Kalshi client: {e}")
-    kalshi_client = None
 
 INDEX_MAPPING = {
     "BTC": "BRTI",
@@ -54,7 +54,6 @@ def fetch_15m_crypto_markets():
             ticker = str(m.get("ticker", "")).upper()
             title = str(m.get("title", ""))
             
-            # Filter specifically for 15-minute rolling crypto series
             if "15M" in ticker or "15 MIN" in title.upper():
                 coin = "ETH"
                 for c in INDEX_MAPPING.keys():
@@ -80,12 +79,20 @@ def fetch_15m_crypto_markets():
         return []
 
 def get_cf_index(index_id: str):
-    """Fetches official CF Benchmarks value using the authenticated Kalshi SDK client"""
+    """Fetches official CF Benchmarks value using the authenticated SDK client API call"""
     if not kalshi_client:
         return None
     try:
-        res = kalshi_client.get(f"/trade-api/v2/cfbenchmarks/values?id={index_id}")
-        payload = res.get("data", {}).get("payload", {})
+        # Use underlying api_client to call the CF Benchmarks endpoint with auto-signed auth headers
+        response_data = kalshi_client.api_client.call_api(
+            "/trade-api/v2/cfbenchmarks/values",
+            "GET",
+            query_params=[("id", index_id)],
+            response_type=object
+        )
+        
+        # response_data[0] contains the deserialized JSON response dictionary
+        payload = response_data[0].get("data", {}).get("payload", {})
         val = payload.get("val")
         avg_60s = payload.get("avg_60s_data", {}).get("avg") or val
         return {"current": val, "avg_60s": avg_60s}
