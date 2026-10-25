@@ -1,5 +1,4 @@
 import os
-import math
 import logging
 import datetime
 import requests
@@ -13,18 +12,17 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 KALSHI_BASE_URL = "https://external-api.kalshi.com"
 
-# Restricted strictly to ETH, XRP, and NEAR 15-minute series with volatility parameters
+# Restricted strictly to ETH, XRP, and NEAR 15-minute series
 SERIES_MAPPING = {
-    "ETH": {"series": "KXETH15M", "vol": 0.75},
-    "XRP": {"series": "KXXRP15M", "vol": 0.95},
-    "NEAR": {"series": "KXNEAR15M", "vol": 1.10}
+    "ETH": "KXETH15M",
+    "XRP": "KXXRP15M",
+    "NEAR": "KXNEAR15M"
 }
 
 def fetch_15m_crypto_markets():
     """Fetches active 15-minute crypto markets for ETH, XRP, and NEAR from Kalshi"""
     results = []
-    for coin, info in SERIES_MAPPING.items():
-        series_ticker = info["series"]
+    for coin, series_ticker in SERIES_MAPPING.items():
         try:
             resp = requests.get(
                 f"{KALSHI_BASE_URL}/trade-api/v2/markets",
@@ -71,7 +69,6 @@ def fetch_15m_crypto_markets():
 
 def get_live_spot_price(coin: str):
     """Multi-source fallback spot price fetcher to bypass cloud IP blocks"""
-    # 1. Try CoinGecko Public API
     try:
         cg_ids = {"ETH": "ethereum", "XRP": "ripple", "NEAR": "near"}
         cg_id = cg_ids.get(coin)
@@ -84,7 +81,6 @@ def get_live_spot_price(coin: str):
     except Exception:
         pass
 
-    # 2. Try Coinbase Public Spot API
     try:
         cb_symbols = {"ETH": "ETH-USD", "XRP": "XRP-USD", "NEAR": "NEAR-USD"}
         symbol = cb_symbols.get(coin)
@@ -97,7 +93,6 @@ def get_live_spot_price(coin: str):
     except Exception:
         pass
 
-    # 3. Try CoinCap Public API
     try:
         cc_ids = {"ETH": "ethereum", "XRP": "xrp", "NEAR": "near"}
         cc_id = cc_ids.get(coin)
@@ -112,44 +107,28 @@ def get_live_spot_price(coin: str):
 
     return None
 
-def calculate_win_probability(spot: float, strike: float, close_time_str: str, volatility: float) -> float:
-    """Quantitative Black-Scholes binary option probability model"""
-    if not spot or not strike or not close_time_str:
-        return 0.5
+def get_seconds_left(close_time_str: str) -> int:
+    """Calculates remaining seconds until contract expiration"""
+    if not close_time_str:
+        return 9999
     try:
         if close_time_str.endswith("Z"):
             close_time_str = close_time_str[:-1] + "+00:00"
         close_dt = datetime.datetime.fromisoformat(close_time_str)
         now_dt = datetime.datetime.now(datetime.timezone.utc)
-        
-        seconds_left = (close_dt - now_dt).total_seconds()
-        if seconds_left <= 0:
-            return 1.0 if spot > strike else 0.0
-            
-        T = seconds_left / (365.25 * 24 * 3600)  # Time in years
-        sigma = volatility
-        ln_sk = math.log(spot / strike)
-        
-        denom = sigma * math.sqrt(T)
-        if denom == 0:
-            return 1.0 if spot > strike else 0.0
-            
-        d2 = (ln_sk - (0.5 * sigma**2) * T) / denom
-        prob = 0.5 * (1.0 + math.erf(d2 / math.sqrt(2.0)))
-        return max(0.01, min(0.99, prob))
-    except Exception as e:
-        logger.error(f"Error computing prediction model: {e}")
-        return 0.5
+        return int((close_dt - now_dt).total_seconds())
+    except Exception:
+        return 9999
 
 # --- Telegram Command Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **ETH, XRP, NEAR 15-Min Quantitative Prediction Bot**\n\n"
+        "🤖 **ETH, XRP, NEAR Late-Clock Momentum Bot Active**\n\n"
         "Commands:\n"
-        "• `/fetchstrikes` - View active contracts & target strikes\n"
-        "• `/predict` - Run mathematical prediction & edge analysis\n"
-        "• `/startalerts` - Turn on 20s automated mispricing alerts\n"
+        "• `/fetchstrikes` - View active 15m contracts & strikes\n"
+        "• `/analyze` - Scan spot vs. strike thresholds & final-minute edges\n"
+        "• `/startalerts` - Turn on 20s background late-clock alerts\n"
         "• `/stopalerts` - Turn off alerts"
     )
 
@@ -163,55 +142,57 @@ async def fetch_strikes_command(update: Update, context: ContextTypes.DEFAULT_TY
     for m in markets[:8]:
         strike_str = f"${m['strike']:,.4f}" if isinstance(m['strike'], (int, float)) else "N/A"
         yes_str = f"${m['yes_price']:.2f}" if isinstance(m['yes_price'], (int, float)) else "N/A"
-        msg += f"• **[{m['coin']}] {m['title']}**\n  Ticker: `{m['ticker']}`\n  Strike: **{strike_str}** | Yes: **{yes_str}**\n\n"
+        secs = get_seconds_left(m['close_time'])
+        mins = secs // 60
+        msg += f"• **[{m['coin niest'] or m['coin']}] {m['title']}**\n  Ticker: `{m['ticker']}`\n  Strike: **{strike_str}** | Yes: **{yes_str}**\n  ⏳ Time Left: **{mins}m ({secs}s)**\n\n"
         
     await update.message.reply_text(msg)
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔮 Running quantitative prediction models...")
+    await update.message.reply_text("🔍 Scanning live spot prices and late-clock thresholds...")
     markets = fetch_15m_crypto_markets()
     if not markets:
         await update.message.reply_text("⚠️ No active 15-minute markets found.")
         return
         
-    msg = "📊 **15-Min Quantitative Prediction & Edge Analysis**\n\n"
+    msg = "📊 **Late-Clock Threshold & Momentum Analysis**\n\n"
     cache_spot = {}
     
     for m in markets[:6]:
         coin = m['coin']
-        info = SERIES_MAPPING.get(coin, {})
-        vol = info.get("vol", 0.8)
-        
         if coin not in cache_spot:
             cache_spot[coin] = get_live_spot_price(coin)
             
         spot = cache_spot[coin]
         strike = m['strike']
         yes_price = m['yes_price']
-        close_time = m['close_time']
+        secs_left = get_seconds_left(m['close_time'])
+        mins_left = secs_left // 60
         
-        prediction_text = "Calculations unavailable"
+        status_text = "Waiting for final 5 minutes..."
         if spot and isinstance(strike, (int, float)):
-            model_prob = calculate_win_probability(spot, strike, close_time, vol)
-            model_prob_pct = int(model_prob * 100)
+            diff = spot - strike
+            yes_cents = int(yes_price * 100) if isinstance(yes_price, (int, float)) else 50
             
-            if isinstance(yes_price, (int, float)):
-                market_prob_pct = int(yes_price * 100)
-                edge = model_prob_pct - market_prob_pct
-                
-                if edge >= 15:
-                    prediction_text = f"🔥 **STRONG BUY YES** (Model: {model_prob_pct}% vs Market: {market_prob_pct}% | Edge: +{edge}%)"
-                elif edge <= -15:
-                    prediction_text = f"⚠️ **OVERPRICED YES / BUY NO** (Model: {model_prob_pct}% vs Market: {market_prob_pct}% | Edge: {edge}%)"
+            if secs_left <= 300: # Final 5 minutes window
+                if spot > strike:
+                    if yes_cents <= 70:
+                        status_text = f"🔥 **LATE MISPRICING (BUY YES):** Spot is +${diff:.4f} above strike with only {mins_left}m left, but Yes is only {yes_cents}¢!"
+                    else:
+                        status_text = f"✅ **CONVERGED ITM:** Spot is +${diff:.4f} above strike ({yes_cents}¢ Yes)"
                 else:
-                    prediction_text = f"⚖️ **Fairly Priced** (Model: {model_prob_pct}% vs Market: {market_prob_pct}%)"
+                    if yes_cents >= 30:
+                        status_text = f"⚠️ **LATE MISPRICING (BUY NO):** Spot is -${abs(diff):.4f} below strike with {mins_left}m left, but Yes is still {yes_cents}¢!"
+                    else:
+                        status_text = f"❌ **CONVERGED OTM:** Spot is -${abs(diff):.4f} below strike ({yes_cents}¢ Yes)"
             else:
-                prediction_text = f"📈 **Model Win Probability:** {model_prob_pct}% (Market Odds N/A)"
+                direction = "ABOVE" if spot > strike else "BELOW"
+                status_text = f"⏳ **Early Window ({mins_left}m left):** Spot is ${abs(diff):.4f} {direction} strike. (Monitoring for final 5m window)"
 
         spot_str = f"${spot:,.4f}" if spot else "Unavailable"
         strike_str = f"${strike:,.4f}" if isinstance(strike, (int, float)) else "N/A"
 
-        msg += f"• **[{coin}] {m['title']}**\n  Strike: **{strike_str}** | Spot: **{spot_str}**\n  Prediction: {prediction_text}\n\n"
+        msg += f"• **[{coin}] {m['title']}**\n  Strike: **{strike_str}** | Spot: **{spot_str}**\n  Status: {status_text}\n\n"
 
     await update.message.reply_text(msg)
 
@@ -232,13 +213,10 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         ticker = m['ticker']
         strike = m['strike']
         yes_price = m['yes_price']
-        close_time = m['close_time']
+        secs_left = get_seconds_left(m['close_time'])
         
         if not isinstance(strike, (int, float)) or not isinstance(yes_price, (int, float)):
             continue
-
-        info = SERIES_MAPPING.get(coin, {})
-        vol = info.get("vol", 0.8)
 
         if coin not in cache_spot:
             cache_spot[coin] = get_live_spot_price(coin)
@@ -247,26 +225,34 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if not spot:
             continue
 
-        model_prob = calculate_win_probability(spot, strike, close_time, vol)
-        model_prob_pct = int(model_prob * 100)
-        market_prob_pct = int(yes_price * 100)
-        edge = model_prob_pct - market_prob_pct
+        diff = spot - strike
+        yes_cents = int(yes_price * 100)
 
-        if edge >= 20:
-            key = f"{ticker}_EDGE"
-            if key not in context.bot_data["alerted"]:
-                context.bot_data["alerted"].add(key)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🚨 **PREDICTION EDGE ALERT [{coin}]** 🚨\n`{ticker}`\nStrike: ${strike:,.4f}\nSpot: ${spot:,.4f}\nModel Win Odds: **{model_prob_pct}%**\nMarket Yes Price: **{market_prob_pct}%**\n⚡ Edge: **+{edge}%**"
-                )
+        # Trigger push alert strictly when entering the final 5 minutes with clear mispricing
+        if secs_left <= 300 and secs_left > 0:
+            if spot > strike and yes_cents <= 65:
+                key = f"{ticker}_LATE_YES"
+                if key not in context.bot_data["alerted"]:
+                    context.bot_data["alerted"].add(key)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚨 **LATE-CLOCK BUY YES [{coin}]** 🚨\n`{ticker}`\n⏳ Time Left: {secs_left}s\nStrike: ${strike:,.4f}\nSpot: ${spot:,.4f} (+${diff:.4f})\nYes Price: **{yes_cents}¢** (Lagging!)"
+                    )
+            elif spot < strike and yes_cents >= 35:
+                key = f"{ticker}_LATE_NO"
+                if key not in context.bot_data["alerted"]:
+                    context.bot_data["alerted"].add(key)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🚨 **LATE-CLOCK BUY NO [{coin}]** 🚨\n`{ticker}`\n⏳ Time Left: {secs_left}s\nStrike: ${strike:,.4f}\nSpot: ${spot:,.4f} (-${abs(diff):.4f})\nYes Price is ⏳ **{yes_cents}¢** (Overpriced!)"
+                    )
 
 async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     context.job_queue.run_repeating(monitor_job, interval=20, first=1, chat_id=chat_id, name=str(chat_id))
-    await update.message.reply_text("🚨 **Quantitative Prediction Alerts Enabled!**")
+    await update.message.reply_text("🚨 **Late-Clock Threshold Alerts Enabled!**")
 
 async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -286,7 +272,6 @@ def main():
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fetchstrikes", fetch_strikes_command))
-    app.add_handler(CommandHandler("predict", analyze_command))
     app.add_handler(CommandHandler("analyze", analyze_command))
     app.add_handler(CommandHandler("startalerts", start_alerts))
     app.add_handler(CommandHandler("stopalerts", stop_alerts))
