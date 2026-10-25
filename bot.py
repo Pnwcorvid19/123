@@ -15,13 +15,13 @@ KALSHI_BASE_URL = "https://external-api.kalshi.com"
 
 # Restricted strictly to ETH, XRP, and NEAR 15-minute series with volatility parameters
 SERIES_MAPPING = {
-    "ETH": {"series": "KXETH15M", "symbol": "ETHUSDT", "vol": 0.75},
-    "XRP": {"series": "KXXRP15M", "symbol": "XRPUSDT", "vol": 0.95},
-    "NEAR": {"series": "KXNEAR15M", "symbol": "NEARUSDT", "vol": 1.10}
+    "ETH": {"series": "KXETH15M", "vol": 0.75},
+    "XRP": {"series": "KXXRP15M", "vol": 0.95},
+    "NEAR": {"series": "KXNEAR15M", "vol": 1.10}
 }
 
 def fetch_15m_crypto_markets():
-    """Fetches active 15-minute crypto markets for ETH, XRP, and NEAR"""
+    """Fetches active 15-minute crypto markets for ETH, XRP, and NEAR from Kalshi"""
     results = []
     for coin, info in SERIES_MAPPING.items():
         series_ticker = info["series"]
@@ -69,14 +69,47 @@ def fetch_15m_crypto_markets():
             
     return results
 
-def get_live_spot_price(symbol: str):
-    """Fetches real-time spot price from Binance"""
+def get_live_spot_price(coin: str):
+    """Multi-source fallback spot price fetcher to bypass cloud IP blocks"""
+    # 1. Try CoinGecko Public API
     try:
-        resp = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=3)
-        if resp.status_code == 200:
-            return float(resp.json().get("price"))
-    except Exception as e:
-        logger.error(f"Error fetching spot for {symbol}: {e}")
+        cg_ids = {"ETH": "ethereum", "XRP": "ripple", "NEAR": "near"}
+        cg_id = cg_ids.get(coin)
+        if cg_id:
+            resp = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=3)
+            if resp.status_code == 200:
+                val = resp.json().get(cg_id, {}).get("usd")
+                if val:
+                    return float(val)
+    except Exception:
+        pass
+
+    # 2. Try Coinbase Public Spot API
+    try:
+        cb_symbols = {"ETH": "ETH-USD", "XRP": "XRP-USD", "NEAR": "NEAR-USD"}
+        symbol = cb_symbols.get(coin)
+        if symbol:
+            resp = requests.get(f"https://api.coinbase.com/v2/prices/{symbol}/spot", timeout=3)
+            if resp.status_code == 200:
+                val = resp.json().get("data", {}).get("amount")
+                if val:
+                    return float(val)
+    except Exception:
+        pass
+
+    # 3. Try CoinCap Public API
+    try:
+        cc_ids = {"ETH": "ethereum", "XRP": "xrp", "NEAR": "near"}
+        cc_id = cc_ids.get(coin)
+        if cc_id:
+            resp = requests.get(f"https://api.coincap.io/v2/assets/{cc_id}", timeout=3)
+            if resp.status_code == 200:
+                val = resp.json().get("data", {}).get("priceUsd")
+                if val:
+                    return float(val)
+    except Exception:
+        pass
+
     return None
 
 def calculate_win_probability(spot: float, strike: float, close_time_str: str, volatility: float) -> float:
@@ -147,11 +180,10 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for m in markets[:6]:
         coin = m['coin']
         info = SERIES_MAPPING.get(coin, {})
-        symbol = info.get("symbol")
         vol = info.get("vol", 0.8)
         
         if coin not in cache_spot:
-            cache_spot[coin] = get_live_spot_price(symbol)
+            cache_spot[coin] = get_live_spot_price(coin)
             
         spot = cache_spot[coin]
         strike = m['strike']
@@ -206,11 +238,10 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         info = SERIES_MAPPING.get(coin, {})
-        symbol = info.get("symbol")
         vol = info.get("vol", 0.8)
 
         if coin not in cache_spot:
-            cache_spot[coin] = get_live_spot_price(symbol)
+            cache_spot[coin] = get_live_spot_price(coin)
             
         spot = cache_spot[coin]
         if not spot:
@@ -221,7 +252,6 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         market_prob_pct = int(yes_price * 100)
         edge = model_prob_pct - market_prob_pct
 
-        # Trigger push alert if model finds a major mispricing edge (+20% or more)
         if edge >= 20:
             key = f"{ticker}_EDGE"
             if key not in context.bot_data["alerted"]:
