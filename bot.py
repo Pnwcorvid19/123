@@ -1,9 +1,10 @@
 import os
+import time
+import base64
 import logging
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from kalshi_python_sync import Configuration, KalshiClient
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,92 +14,131 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID")
 KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY")
 
-# Initialize Official Kalshi Client using Configuration object
-kalshi_client = None
-try:
-    if KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PEM:
-        formatted_key = KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n")
-        
-        config = Configuration(host="https://external-api.kalshi.com/trade-api/v2")
-        config.api_key_id = KALSHI_KEY_ID
-        config.private_key_pem = formatted_key
-        
-        kalshi_client = KalshiClient(config)
-        logger.info("Kalshi client initialized successfully.")
-except Exception as e:
-    logger.error(f"Failed to initialize Kalshi client: {e}")
+KALSHI_BASE_URL = "https://external-api.kalshi.com"
 
-# Mapping coins to their exact 15-minute Kalshi series tickers & CF Index IDs
+# Restricted strictly to Ethereum, XRP, and NEAR 15-minute markets
 SERIES_MAPPING = {
-    "BTC": {"series": "KXBTC15M", "index": "BRTI"},
     "ETH": {"series": "KXETH15M", "index": "ETHUSD_RTI"},
-    "SOL": {"series": "KXSOL15M", "index": "SOLUSD_RTI"},
     "XRP": {"series": "KXXRP15M", "index": "XRPUSD_RTI"},
-    "DOGE": {"series": "KXDOGE15M", "index": "DOGEUSD_RTI"},
-    "SUI": {"series": "KXSUI15M", "index": "SUIUSD_RTI"}
+    "NEAR": {"series": "KXNEAR15M", "index": "NEARUSD_RTI"}
 }
 
+def sign_kalshi_request(method: str, path: str) -> dict:
+    """Generates native RSA-PSS authentication headers for Kalshi API calls"""
+    if not KALSHI_KEY_ID or not KALSHI_PRIVATE_KEY_PEM:
+        logger.warning("Missing Kalshi API Key ID or Private Key environment variables.")
+        return {}
+        
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives import serialization
+        
+        timestamp_ms = str(int(time.time() * 1000))
+        msg = f"{timestamp_ms}{method}{path}".encode('utf-8')
+        
+        formatted_key = KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n")
+        private_key = serialization.load_pem_private_key(
+            formatted_key.encode('utf-8'),
+            password=None
+        )
+        
+        signature = private_key.sign(
+            msg,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        
+        sig_b64 = base64.b64encode(signature).decode('utf-8')
+        
+        return {
+            "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+            "Content-Type": "application/json"
+        }
+    except Exception as e:
+        logger.error(f"Error signing Kalshi request: {e}")
+        return {}
+
 def fetch_15m_crypto_markets():
-    """Fetches active 15-minute crypto markets by explicitly querying each coin's series ticker"""
+    """Fetches active 15-minute crypto markets for ETH, XRP, and NEAR"""
     results = []
     for coin, info in SERIES_MAPPING.items():
         series_ticker = info["series"]
         try:
             resp = requests.get(
-                "https://external-api.kalshi.com/trade-api/v2/markets",
+                f"{KALSHI_BASE_URL}/trade-api/v2/markets",
                 params={"series_ticker": series_ticker, "status": "open"},
                 timeout=5
             )
-            data = resp.json()
-            markets = data.get("markets", [])
-            
-            for m in markets:
-                ticker = str(m.get("ticker", "")).upper()
-                title = str(m.get("title", ""))
-                strike = m.get("floor_strike") or m.get("strike_price") or m.get("cap_strike")
-                yes_bid = m.get("yes_bid_dollars") or m.get("yes_bid")
-                if isinstance(yes_bid, (int, float)) and yes_bid > 1.0:
-                    yes_bid = yes_bid / 100.0
+            if resp.status_code == 200:
+                markets = resp.json().get("markets", [])
+                for m in markets:
+                    ticker = str(m.get("ticker", "")).upper()
+                    title = str(m.get("title", ""))
+                    strike = m.get("floor_strike") or m.get("strike_price") or m.get("cap_strike")
+                    
+                    yes_price = (
+                        m.get("yes_bid_dollars") or 
+                        m.get("yes_ask_dollars") or 
+                        m.get("last_price_dollars") or 
+                        m.get("yes_bid") or 
+                        m.get("yes_price")
+                    )
+                    
+                    if isinstance(yes_price, str):
+                        try:
+                            yes_price = float(yes_price)
+                        except ValueError:
+                            yes_price = None
 
-                results.append({
-                    "coin": coin,
-                    "ticker": ticker,
-                    "title": title,
-                    "strike": strike,
-                    "yes_price": yes_bid
-                })
+                    if isinstance(yes_price, (int, float)) and yes_price > 1.0:
+                        yes_price = yes_price / 100.0
+
+                    results.append({
+                        "coin": coin,
+                        "ticker": ticker,
+                        "title": title,
+                        "strike": strike,
+                        "yes_price": yes_price
+                    })
         except Exception as e:
             logger.error(f"Error fetching markets for {series_ticker}: {e}")
             
     return results
 
 def get_cf_index(index_id: str):
-    """Fetches official CF Benchmarks value using the authenticated SDK client API call"""
-    if not kalshi_client:
-        return None
+    """Fetches official CF Benchmarks index value using native signed headers"""
+    path = f"/trade-api/v2/cfbenchmarks/values"
+    url = f"{KALSHI_BASE_URL}{path}?id={index_id}"
+    headers = sign_kalshi_request("GET", path)
+    
     try:
-        response_data = kalshi_client.api_client.call_api(
-            "/trade-api/v2/cfbenchmarks/values",
-            "GET",
-            query_params=[("id", index_id)],
-            response_type=object
-        )
-        payload = response_data[0].get("data", {}).get("payload", {})
-        val = payload.get("val")
-        avg_60s = payload.get("avg_60s_data", {}).get("avg") or val
-        return {"current": val, "avg_60s": avg_60s}
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            payload = resp.json().get("data", {}).get("payload", {})
+            val = payload.get("val")
+            avg_60s = payload.get("avg_60s_data", {}).get("avg") or val
+            return {"current": val, "avg_60s": avg_60s}
+        else:
+            logger.error(f"CF Index API Error [{resp.status_code}] for {index_id}: {resp.text}")
     except Exception as e:
-        logger.error(f"Error pulling CF benchmark for {index_id}: {e}")
-        return None
+        logger.error(f"Error fetching CF benchmark {index_id}: {e}")
+        
+    return {"current": None, "avg_60s": None}
 
 # --- Telegram Command Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 **Kalshi 15-Min Multi-Crypto Bot Active**\n\n"
+        "🤖 **Kalshi ETH, XRP, NEAR 15-Min Edge Bot Active**\n\n"
         "Commands:\n"
-        "• `/fetchstrikes` - View active 15m crypto target prices\n"
-        "• `/analyze` - Run official settlement index analysis & predictions\n"
+        "• `/fetchstrikes` - View active 15m ETH, XRP, NEAR targets\n"
+        "• `/analyze` - Run official settlement index analysis & edge check\n"
         "• `/startalerts` - Turn on 20s background push notifications\n"
         "• `/stopalerts` - Turn off background alerts"
     )
@@ -106,30 +146,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def fetch_strikes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markets = fetch_15m_crypto_markets()
     if not markets:
-        await update.message.reply_text("⚠️ No active 15-minute crypto markets found right now.")
+        await update.message.reply_text("⚠️ No active 15-minute ETH, XRP, or NEAR markets found right now.")
         return
         
-    msg = "⏱ **Active 15-Min Crypto Contracts**\n\n"
+    msg = "⏱ **Active 15-Min ETH, XRP & NEAR Contracts**\n\n"
     for m in markets[:8]:
-        strike_str = f"${m['strike']:,.2f}" if isinstance(m['strike'], (int, float)) else "N/A"
+        strike_str = f"${m['strike']:,.4f}" if isinstance(m['strike'], (int, float)) else "N/A"
         yes_str = f"${m['yes_price']:.2f}" if isinstance(m['yes_price'], (int, float)) else "N/A"
         msg += f"• **[{m['coin']}] {m['title']}**\n  Ticker: `{m['ticker']}`\n  Strike: **{strike_str}** | Yes: **{yes_str}**\n\n"
         
     await update.message.reply_text(msg)
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Fetching official CF Benchmarks & analyzing markets...")
+    await update.message.reply_text("🔍 Fetching official CF Benchmarks for ETH, XRP, NEAR...")
     markets = fetch_15m_crypto_markets()
     if not markets:
         await update.message.reply_text("⚠️ No active 15-minute markets found.")
         return
         
-    msg = "🧮 **15-Min Settlement Index & Prediction Analysis**\n\n"
+    msg = "🧮 **ETH, XRP, NEAR Settlement Index & Edge Analysis**\n\n"
     cache = {}
     
     for m in markets[:6]:
         coin = m['coin']
-        index_id = SERIES_MAPPING.get(coin, {}).get("index", "ETHUSD_RTI")
+        index_id = SERIES_MAPPING.get(coin, {}).get("index")
         
         if index_id not in cache:
             cache[index_id] = get_cf_index(index_id)
@@ -145,12 +185,12 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             diff = settlement_ref - strike
             prob = int(yes_price * 100)
             if settlement_ref > strike:
-                insight = f"✅ **ITM:** Index is +${diff:.2f} above strike ({prob}% Yes odds)" if prob >= 50 else f"🔥 **UNDERPRICED YES:** Index is +${diff:.2f} above strike, but Yes is only {prob}%!"
+                insight = f"✅ **ITM:** Index +${diff:.4f} above strike ({prob}% Yes odds)" if prob >= 50 else f"🔥 **UNDERPRICED YES:** Index +${diff:.4f} above strike, but Yes is only {prob}%!"
             else:
-                insight = f"❌ **OTM:** Index is -${abs(diff):.2f} below strike ({prob}% Yes odds)" if prob < 50 else f"⚠️ **OVERPRICED YES:** Index is -${abs(diff):.2f} below strike, but Yes is {prob}%!"
+                insight = f"❌ **OTM:** Index -${abs(diff):.4f} below strike ({prob}% Yes odds)" if prob < 50 else f"⚠️ **OVERPRICED YES:** Index -${abs(diff):.4f} below strike, but Yes is {prob}%!"
 
-        ref_str = f"${settlement_ref:,.2f}" if settlement_ref else "Unavailable (Check API Keys)"
-        strike_str = f"${strike:,.2f}" if isinstance(strike, (int, float)) else "N/A"
+        ref_str = f"${settlement_ref:,.4f}" if settlement_ref else "Unavailable (Check Render Env Keys)"
+        strike_str = f"${strike:,.4f}" if isinstance(strike, (int, float)) else "N/A"
 
         msg += f"• **[{coin}] {m['title']}**\n  Target Strike: **{strike_str}**\n  CF Index (60s Avg): **{ref_str}**\n  Status: {insight}\n\n"
 
@@ -177,7 +217,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(strike, (int, float)) or not isinstance(yes_price, (int, float)):
             continue
 
-        index_id = SERIES_MAPPING.get(coin, {}).get("index", "ETHUSD_RTI")
+        index_id = SERIES_MAPPING.get(coin, {}).get("index")
         if index_id not in cache:
             cache[index_id] = get_cf_index(index_id)
             
@@ -195,7 +235,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 context.bot_data["alerted"].add(key)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"🔥 **MISPRICING ALERT [{coin}]** 🔥\n`{ticker}`\nStrike: ${strike:,.2f}\nIndex: ${settlement_ref:,.2f} (+${diff:.2f})\nYes Odds: {prob}%"
+                    text=f"🔥 **MISPRICING ALERT [{coin}]** 🔥\n`{ticker}`\nStrike: ${strike:,.4f}\nIndex: ${settlement_ref:,.4f} (+${diff:.4f})\nYes Odds: {prob}%"
                 )
 
 async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,7 +243,7 @@ async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in context.job_queue.get_jobs_by_name(str(chat_id)):
         job.schedule_removal()
     context.job_queue.run_repeating(monitor_job, interval=20, first=1, chat_id=chat_id, name=str(chat_id))
-    await update.message.reply_text("🚨 **Live Background Alerts Enabled!**")
+    await update.message.reply_text("🚨 **ETH, XRP, NEAR Live Alerts Enabled!**")
 
 async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
