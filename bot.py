@@ -67,7 +67,6 @@ def fetch_single_market(coin, series_ticker):
     return results
 
 def fetch_15m_crypto_markets():
-    """Fetches active 15-minute crypto markets concurrently across all coins"""
     results = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(fetch_single_market, coin, ticker): coin for coin, ticker in SERIES_MAPPING.items()}
@@ -78,7 +77,6 @@ def fetch_15m_crypto_markets():
     return results
 
 def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
-    """Queries Kalshi's public order book to measure YES vs NO depth imbalance and spread"""
     try:
         resp = requests.get(f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}/orderbook", timeout=2)
         if resp.status_code == 200:
@@ -97,7 +95,6 @@ def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
     return {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
 
 def get_live_spot_price(coin: str):
-    """Multi-source fallback spot price fetcher with 1-minute velocity tracking"""
     current_price = None
     
     # 1. CoinGecko
@@ -153,7 +150,6 @@ def get_live_spot_price(coin: str):
         except Exception:
             pass
 
-    # Record spot history for velocity calculation
     now = time.time()
     if current_price:
         if coin not in SPOT_HISTORY:
@@ -164,7 +160,6 @@ def get_live_spot_price(coin: str):
     return current_price
 
 def get_spot_velocity(coin: str) -> float:
-    """Calculates 1-minute rate of price change (%)"""
     history = SPOT_HISTORY.get(coin, [])
     if len(history) < 2:
         return 0.0
@@ -178,7 +173,6 @@ def get_spot_velocity(coin: str) -> float:
     return ((recent - past) / past) * 100.0
 
 def get_seconds_left(close_time_str: str) -> int:
-    """Calculates remaining seconds until contract expiration"""
     if not close_time_str:
         return 9999
     try:
@@ -192,5 +186,3 @@ def get_seconds_left(close_time_str: str) -> int:
 
 # --- Telegram Command Handlers ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
