@@ -52,7 +52,7 @@ def start_health_check_server():
             self.wfile.write(b"OK")
             
         def log_message(self, format, *args):
-            pass  # Suppress HTTP health log spam
+            pass
 
     try:
         server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
@@ -151,7 +151,6 @@ def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
 
 def get_live_spot_price(coin: str):
     current_price = None
-    
     try:
         cg_ids = {
             "ETH": "ethereum", "XRP": "ripple", "NEAR": "near",
@@ -252,46 +251,53 @@ def evaluate_forward_prediction(coin, spot, strike, yes_bid, yes_ask, vel, ob_ra
     yes_cents = int(yes_bid * 100) if isinstance(yes_bid, (int, float)) else 50
     spread = abs(yes_ask - yes_bid) if isinstance(yes_ask, (int, float)) and isinstance(yes_bid, (int, float)) else 0.05
     
+    # Scale buffer dynamically in final 90s to filter micro-whipsaws
     min_buf = MIN_BUFFERS.get(coin, 1.0)
+    if secs_left <= 90:
+        min_buf *= 1.5 
+        
     is_within_noise_zone = abs_diff < min_buf
     
-    momentum_bias = vel * 2.5
-    depth_bias = (ob_ratio - 0.5) * 3.0
-    beta_bias = 0.4 if avg_market_beta > 0 else -0.4
+    # Unified multi-factor scoring model
+    gap_score = pct_diff * 50.0
+    momentum_score = vel * 12.0
+    depth_score = (ob_ratio - 0.5) * 8.0
     
-    if secs_left <= 90:
-        if is_within_noise_zone:
-            return "TOSS-UP", f"Too close to strike (${abs_diff:.4f} < min buffer ${min_buf}). High risk of noise reversal."
-        
-        if diff > 0:
-            score = 5.0 + (pct_diff * 100) + momentum_bias
-        else:
-            score = -5.0 + (pct_diff * 100) + momentum_bias
-    else:
-        score = (pct_diff * 40) + (momentum_bias * 2.5) + (depth_bias * 2.0) + beta_bias
-        
+    score = gap_score + momentum_score + depth_score
+    
     prediction = "PENDING"
     rationale = ""
     
-    if is_within_noise_zone and secs_left <= 90:
-        prediction = "TOSS-UP"
-        rationale = f"Within noise buffer (${abs_diff:.4f} gap < ${min_buf}). Too close to call."
-    elif score > 0.6:
-        prediction = "YES"
-        if secs_left <= 90 and yes_cents <= 75 and spread <= 0.08 and not is_within_noise_zone:
-            rationale = f"FINAL 90S HIGH EDGE (+${diff:.4f} above strike, safe buffer). BUY YES at {yes_cents} cents"
-        else:
-            rationale = f"Bullish trajectory | Spot +${diff:.4f} above strike | Vel: {vel:+.2f}%, OB: {int(ob_ratio*100)}% YES"
-    elif score < -0.6:
-        prediction = "NO"
-        if secs_left <= 90 and yes_cents >= 25 and spread <= 0.08 and not is_within_noise_zone:
-            rationale = f"FINAL 90S HIGH EDGE (-${abs_diff:.4f} below strike, safe buffer). BUY NO / YES is {yes_cents} cents"
-        else:
-            rationale = f"Bearish trajectory | Spot -${abs_diff:.4f} below strike | Vel: {vel:+.2f}%, OB: {int(ob_ratio*100)}% YES"
-    else:
-        prediction = "TOSS-UP"
-        rationale = f"Zone boundary / Low edge | Diff: ${diff:+.4f} | Vel: {vel:+.2f}%, OB: {int(ob_ratio*100)}% YES"
+    if is_within_noise_zone:
+        return "TOSS-UP", f"Inside noise buffer (${abs_diff:.4f} gap < ${min_buf:.2f}). Too close to call."
         
+    if secs_left <= 90:
+        # Strict Momentum Alignment Check (Prevents falling knives and short squeezes)
+        if diff > 0 and vel < -0.05:
+            return "TOSS-UP", f"Spot is above strike, but velocity is crashing ({vel:+.2f}%). Falling knife risk."
+        if diff < 0 and vel > 0.05:
+            return "TOSS-UP", f"Spot is below strike, but velocity is pumping ({vel:+.2f}%). Short squeeze risk."
+            
+        if score > 0.8 and yes_cents <= 75 and spread <= 0.08:
+            prediction = "YES"
+            rationale = f"FINAL 90S HIGH EDGE | Gap: +${diff:.4f} | Vel: {vel:+.2f}% | BUY YES at {yes_cents} cents"
+        elif score < -0.8 and yes_cents >= 25 and spread <= 0.08:
+            prediction = "NO"
+            rationale = f"FINAL 90S HIGH EDGE | Gap: -${abs_diff:.4f} | Vel: {vel:+.2f}% | BUY NO / YES at {yes_cents} cents"
+        else:
+            prediction = "TOSS-UP"
+            rationale = f"Mixed momentum | Score: {score:.2f} | Gap: ${diff:+.4f} | Vel: {vel:+.2f}%"
+    else:
+        if score > 0.6:
+            prediction = "YES"
+            rationale = f"Bullish trajectory | Score: {score:.2f} | Gap: +${diff:.4f}"
+        elif score < -0.6:
+            prediction = "NO"
+            rationale = f"Bearish trajectory | Score: {score:.2f} | Gap: -${abs_diff:.4f}"
+        else:
+            prediction = "TOSS-UP"
+            rationale = f"Low edge range | Score: {score:.2f}"
+            
     return prediction, rationale
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -480,7 +486,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 f"Time Left: {secs_left}s\n"
                                 f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
                                 f"Velocity: {vel:+.2f}% | Orderbook: {ob_ratio_pct}% YES\n"
-                                f"Yes Price: {yes_cents} cents (Safe Buffer & Expiry Edge!)"
+                                f"Yes Price: {yes_cents} cents (Safe Buffer & Momentum Aligned!)"
                             )
                         )
                 elif prediction == "NO" and yes_cents >= 25:
@@ -495,7 +501,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                                 f"Time Left: {secs_left}s\n"
                                 f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
                                 f"Velocity: {vel:+.2f}% | Orderbook: {ob_ratio_pct}% YES\n"
-                                f"Yes Price: {yes_cents} cents (Safe Buffer & Expiry Edge!)"
+                                f"Yes Price: {yes_cents} cents (Safe Buffer & Momentum Aligned!)"
                             )
                         )
     except Exception as e:
