@@ -2,97 +2,113 @@ import os
 import logging
 import requests
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Enable logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration (Replace with your actual tokens or use Environment Variables)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2" # or production API endpoint
+# Define all the Kalshi contract strike prices you want to monitor
+KALSHI_STRIKES = [3000.0, 3100.0, 3200.0, 3300.0]
 
-def get_active_eth_15m_market():
-    """Fetches the active Kalshi 15-minute Ethereum market."""
+# Set how often to check in seconds (e.g., 30 seconds for faster updates)
+CHECK_INTERVAL_SECONDS = 30 
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    strikes_formatted = ", ".join([f"${s}" for s in KALSHI_STRIKES])
+    await update.message.reply_text(
+        f"🤖 **Kalshi Multi-Strike Alert Bot Connected!**\n\n"
+        f"🎯 Active Targets: {strikes_formatted}\n"
+        f"⏱ Check Frequency: Every {CHECK_INTERVAL_SECONDS} seconds\n\n"
+        f"Type `/setalert` to start live tracking."
+    )
+
+async def get_eth_price():
+    """Fetches the live Ethereum price from CoinGecko API"""
     try:
-        # Searching for active 15-min ETH series ticker (e.g., KXETH15M)
-        url = f"{KALSHI_API_BASE}/markets?series_ticker=KXETH15M&status=open"
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
         response = requests.get(url, timeout=10)
         data = response.json()
-        markets = data.get("markets", [])
-        if not markets:
-            return None
-        # Return the nearest expiring market
-        return markets[0]
-    except Exception as e:
-        logger.error(f"Error fetching Kalshi market: {e}")
-        return None
-
-def get_current_eth_price():
-    """
-    Fetches the current ETH price from a reliable high-frequency spot source 
-    or CF Benchmarks proxy feed.
-    """
-    try:
-        # Using Coinbase/Binance public ticker as a fast proxy to CF Benchmarks spot behavior
-        res = requests.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=5)
-        data = res.json()
-        return float(data["data"]["amount"])
+        return float(data["ethereum"]["usd"])
     except Exception as e:
         logger.error(f"Error fetching ETH price: {e}")
         return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a welcome message when the command /start is issued."""
-    await update.message.reply_text(
-        "🤖 **Kalshi ETH 15-Min Sniper Bot Initialized**\n\n"
-        "Use /check to analyze the active 15-minute Ethereum market right now."
-    )
-
-async def check_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Analyzes the active market and returns YES/NO prediction guidance."""
-    msg = await update.message.reply_text("🔍 Fetching latest Kalshi strike and live ETH data...")
+async def check_all_strikes(context: ContextTypes.DEFAULT_TYPE):
+    """Checks live ETH spot price against all active Kalshi strike targets"""
+    chat_id = context.job.chat_id
+    current_price = await get_eth_price()
     
-    market = get_active_eth_15m_market()
-    current_price = get_current_eth_price()
-    
-    if not market or not current_price:
-        await msg.edit_text("❌ Error: Could not fetch data from Kalshi or Price Feed APIs.")
+    if current_price is None:
         return
 
-    title = market.get("title", "ETH 15-min Market")
-    strike_price = market.get("floor_strike", None)
+    logger.info(f"Checked Spot ETH: ${current_price}")
+
+    # Track which alerts have already triggered to avoid spamming
+    if "triggered_alerts" not in context.bot_data:
+        context.bot_data["triggered_alerts"] = set()
+
+    for strike in KALSHI_STRIKES:
+        # Check if price dropped below or reached a lower strike
+        if current_price <= strike and f"UNDER_{strike}" not in context.bot_data["triggered_alerts"]:
+            context.bot_data["triggered_alerts"].add(f"UNDER_{strike}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🚨 **KALSHI STRIKE CROSSED BELOW!** 🚨\n\n"
+                     f"Current ETH Spot: **${current_price}**\n"
+                     f"Strike Price: **${strike}**\n\n"
+                     f"⚡ Check Kalshi contract immediately!"
+            )
+        
+        # Check if price broke above an upper strike
+        elif current_price >= strike and f"ABOVE_{strike}" not in context.bot_data["triggered_alerts"]:
+            context.bot_data["triggered_alerts"].add(f"ABOVE_{strike}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🚀 **KALSHI STRIKE CROSSED ABOVE!** 🚀\n\n"
+                     f"Current ETH Spot: **${current_price}**\n"
+                     f"Strike Price: **${strike}**\n\n"
+                     f"⚡ Check Kalshi contract immediately!"
+            )
+
+async def set_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the multi-strike background tracking loop"""
+    chat_id = update.effective_chat.id
     
-    # Fallback parsing if strike is embedded in subtitle/title if floor_strike key differs
-    if strike_price is None:
-        # Kalshi API structure adjustment if necessary
-        strike_price = market.get("strike_price", 0.0)
+    # Remove any existing scheduled jobs
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
 
-    # Comparison logic
-    is_above = current_price > float(strike_price) if strike_price else False
-    prediction = "YES (Above Strike)" if is_above else "NO (Below Strike)"
-    spread = abs(current_price - float(strike_price)) if strike_price else 0.0
-
-    report = (
-        f"📊 **Kalshi ETH 15-Min Market Status**\n\n"
-        f"• **Market:** {title}\n"
-        f"• **Strike Target:** ${strike_price}\n"
-        f"• **Live Reference Price:** ${current_price:,.2f}\n"
-        f"• **Spread:** ${spread:.2f}\n\n"
-        f"🎯 **Current Lean:** **{prediction}**"
+    # Schedule the recurring check interval
+    context.job_queue.run_repeating(
+        check_all_strikes, 
+        interval=CHECK_INTERVAL_SECONDS, 
+        first=0, 
+        chat_id=chat_id,
+        name=str(chat_id)
     )
     
-    await msg.edit_text(report, parse_mode="Markdown")
+    strikes_formatted = ", ".join([f"${s}" for s in KALSHI_STRIKES])
+    await update.message.reply_text(
+        f"✅ **Multi-Strike Alerts Enabled!**\n"
+        f"Tracking: {strikes_formatted}\n"
+        f"Interval: Every {CHECK_INTERVAL_SECONDS} seconds."
+    )
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("check", check_market))
-    
-    logger.info("Bot is polling...")
-    app.run_polling()
+    if not BOT_TOKEN:
+        raise ValueError("No BOT_TOKEN environment variable found!")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setalert", set_alert))
+
+    logger.info("Bot starting...")
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
