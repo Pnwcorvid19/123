@@ -1,5 +1,6 @@
 import os
 import time
+import math
 import logging
 import datetime
 import requests
@@ -26,18 +27,6 @@ SERIES_MAPPING = {
     "BNB": "KXBNB15M",
     "ZEC": "KXZEC15M",
     "HYPE": "KXHYPE15M"
-}
-
-# Minimum safety distance from strike to filter out market noise
-MIN_BUFFERS = {
-    "BTC": 30.0,
-    "ETH": 4.0,
-    "SOL": 0.5,
-    "BNB": 1.0,
-    "NEAR": 0.02,
-    "XRP": 0.01,
-    "ZEC": 0.2,
-    "HYPE": 0.05
 }
 
 SPOT_HISTORY = {}
@@ -130,25 +119,6 @@ def fetch_15m_crypto_markets():
         logger.error(f"Error in fetch_15m_crypto_markets: {e}")
     return results
 
-def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
-    try:
-        resp = requests.get(f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}/orderbook", timeout=2)
-        if resp.status_code == 200:
-            body = resp.json()
-            ob = body.get("orderbook_fp") or body.get("orderbook") or {}
-            yes_orders = ob.get("yes_dollars") or ob.get("yes") or []
-            no_orders = ob.get("no_dollars") or ob.get("no") or []
-            
-            yes_volume = sum([float(o[1]) for o in yes_orders if len(o) >= 2])
-            no_volume = sum([float(o[1]) for o in no_orders if len(o) >= 2])
-            
-            total_vol = yes_volume + no_volume
-            ratio = (yes_volume / total_vol) if total_vol > 0 else 0.5
-            return {"yes_vol": yes_volume, "no_vol": no_volume, "ratio": ratio}
-    except Exception as e:
-        logger.error(f"Error fetching orderbook for {ticker}: {e}")
-    return {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
-
 def get_live_spot_price(coin: str):
     current_price = None
     try:
@@ -213,22 +183,6 @@ def get_live_spot_price(coin: str):
 
     return current_price
 
-def get_spot_velocity(coin: str) -> float:
-    try:
-        history = SPOT_HISTORY.get(coin, [])
-        if len(history) < 2:
-            return 0.0
-        
-        now = time.time()
-        recent = history[-1][1]
-        past = next((p[1] for p in history if now - p[0] >= 45), history[0][1])
-        
-        if past == 0:
-            return 0.0
-        return ((recent - past) / past) * 100.0
-    except Exception:
-        return 0.0
-
 def get_seconds_left(close_time_str: str) -> int:
     if not close_time_str:
         return 9999
@@ -241,320 +195,16 @@ def get_seconds_left(close_time_str: str) -> int:
     except Exception:
         return 9999
 
-def evaluate_forward_prediction(coin, spot, strike, yes_bid, yes_ask, vel, ob_ratio, secs_left, avg_market_beta):
-    if spot is None or not isinstance(strike, (int, float)) or strike <= 0:
-        return "PENDING", "Insufficient market data for forecasting."
-        
-    diff = spot - strike
-    abs_diff = abs(diff)
-    pct_diff = (diff / strike) * 100
-    yes_cents = int(yes_bid * 100) if isinstance(yes_bid, (int, float)) else 50
-    spread = abs(yes_ask - yes_bid) if isinstance(yes_ask, (int, float)) and isinstance(yes_bid, (int, float)) else 0.05
+def norm_cdf(x):
+    """Standard normal cumulative distribution function using math.erf"""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def calculate_realized_volatility(coin: str) -> float:
+    """Calculates annualized volatility sigma from recent SPOT_HISTORY buffer"""
+    history = SPOT_HISTORY.get(coin, [])
+    if len(history) < 4:
+        return 0.75  # Default baseline annualized volatility for crypto (75%)
     
-    # Scale buffer dynamically in final 90s to filter micro-whipsaws
-    min_buf = MIN_BUFFERS.get(coin, 1.0)
-    if secs_left <= 90:
-        min_buf *= 1.5 
-        
-    is_within_noise_zone = abs_diff < min_buf
-    
-    # Unified multi-factor scoring model
-    gap_score = pct_diff * 50.0
-    momentum_score = vel * 12.0
-    depth_score = (ob_ratio - 0.5) * 8.0
-    
-    score = gap_score + momentum_score + depth_score
-    
-    prediction = "PENDING"
-    rationale = ""
-    
-    if is_within_noise_zone:
-        return "TOSS-UP", f"Inside noise buffer (${abs_diff:.4f} gap < ${min_buf:.2f}). Too close to call."
-        
-    if secs_left <= 90:
-        # Strict Momentum Alignment Check (Prevents falling knives and short squeezes)
-        if diff > 0 and vel < -0.05:
-            return "TOSS-UP", f"Spot is above strike, but velocity is crashing ({vel:+.2f}%). Falling knife risk."
-        if diff < 0 and vel > 0.05:
-            return "TOSS-UP", f"Spot is below strike, but velocity is pumping ({vel:+.2f}%). Short squeeze risk."
-            
-        if score > 0.8 and yes_cents <= 75 and spread <= 0.08:
-            prediction = "YES"
-            rationale = f"FINAL 90S HIGH EDGE | Gap: +${diff:.4f} | Vel: {vel:+.2f}% | BUY YES at {yes_cents} cents"
-        elif score < -0.8 and yes_cents >= 25 and spread <= 0.08:
-            prediction = "NO"
-            rationale = f"FINAL 90S HIGH EDGE | Gap: -${abs_diff:.4f} | Vel: {vel:+.2f}% | BUY NO / YES at {yes_cents} cents"
-        else:
-            prediction = "TOSS-UP"
-            rationale = f"Mixed momentum | Score: {score:.2f} | Gap: ${diff:+.4f} | Vel: {vel:+.2f}%"
-    else:
-        if score > 0.6:
-            prediction = "YES"
-            rationale = f"Bullish trajectory | Score: {score:.2f} | Gap: +${diff:.4f}"
-        elif score < -0.6:
-            prediction = "NO"
-            rationale = f"Bearish trajectory | Score: {score:.2f} | Gap: -${abs_diff:.4f}"
-        else:
-            prediction = "TOSS-UP"
-            rationale = f"Low edge range | Score: {score:.2f}"
-            
-    return prediction, rationale
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text(
-            "Crypto Multi-Factor Prediction Bot Active\n\n"
-            "Commands:\n"
-            "- /fetchstrikes - View active 15m contracts & strikes\n"
-            "- /analyze - Run forward-looking trajectory predictions\n"
-            "- /startalerts - Turn on background alerts\n"
-            "- /stopalerts - Turn off alerts"
-        )
-    except Exception as e:
-        logger.error(f"Error in start command: {e}")
-
-async def fetch_strikes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        markets = fetch_15m_crypto_markets()
-        if not markets:
-            await update.message.reply_text("No active 15-minute markets found right now.")
-            return
-            
-        msg = "Active 15-Min Crypto Contracts\n\n"
-        for m in markets[:12]:
-            c_coin = m["coin"]
-            c_title = m["title"]
-            c_ticker = m["ticker"]
-            strike_val = m["strike"]
-            yes_val = m["yes_bid"]
-            
-            strike_str = f"${strike_val:,.4f}" if isinstance(strike_val, (int, float)) else "N/A"
-            yes_bid_str = f"${yes_val:.2f}" if isinstance(yes_val, (int, float)) else "N/A"
-            secs = get_seconds_left(m["close_time"])
-            mins = secs // 60
-            
-            msg += f"[{c_coin}] {c_title}\n  Ticker: {c_ticker}\n  Strike: {strike_str} | Yes Bid: {yes_bid_str}\n  Time Left: {mins}m ({secs}s)\n\n"
-            
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.error(f"Error in fetch_strikes_command: {e}")
-
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_text("Analyzing forward trajectory, velocity momentum, and orderbook depth across all coins...")
-        markets = fetch_15m_crypto_markets()
-        if not markets:
-            await update.message.reply_text("No active 15-minute markets found.")
-            return
-            
-        cache_spot = {}
-        cache_vel = {}
-        cache_ob = {}
-        
-        active_markets = markets[:10]
-
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            spot_futures = {executor.submit(get_live_spot_price, coin): coin for coin in SERIES_MAPPING.keys()}
-            ob_futures = {executor.submit(fetch_kalshi_orderbook_imbalance, m["ticker"]): m["ticker"] for m in active_markets}
-            
-            for future in as_completed(spot_futures):
-                coin = spot_futures[future]
-                try:
-                    cache_spot[coin] = future.result()
-                    cache_vel[coin] = get_spot_velocity(coin)
-                except Exception:
-                    cache_spot[coin] = None
-                    cache_vel[coin] = 0.0
-
-            for future in as_completed(ob_futures):
-                ticker = ob_futures[future]
-                try:
-                    cache_ob[ticker] = future.result()
-                except Exception:
-                    cache_ob[ticker] = {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
-
-        valid_vels = [v for v in cache_vel.values() if v != 0.0]
-        avg_velocity = sum(valid_vels) / len(valid_vels) if valid_vels else 0.0
-
-        msg = "Forward-Looking Expiry Forecast & Analysis\n\n"
-        
-        for m in active_markets:
-            coin = m["coin"]
-            ticker = m["ticker"]
-            title = m["title"]
-            spot = cache_spot.get(coin)
-            strike = m["strike"]
-            yes_bid = m["yes_bid"] if isinstance(m["yes_bid"], (int, float)) else 0.5
-            yes_ask = m["yes_ask"] if isinstance(m["yes_ask"], (int, float)) else 0.5
-            secs_left = get_seconds_left(m["close_time"])
-            
-            ob = cache_ob.get(ticker, {"ratio": 0.5})
-            vel = cache_vel.get(coin, 0.0)
-            spread = abs(yes_ask - yes_bid)
-            
-            prediction, rationale = evaluate_forward_prediction(
-                coin, spot, strike, yes_bid, yes_ask, vel, ob["ratio"], secs_left, avg_velocity
-            )
-
-            spot_str = f"${spot:,.4f}" if spot is not None else "Unavailable"
-            strike_str = f"${strike:,.4f}" if isinstance(strike, (int, float)) else "N/A"
-            spread_cents = int(spread * 100)
-            ob_ratio_pct = int(ob["ratio"] * 100)
-
-            msg += (
-                f"[{coin}] {title}\n"
-                f"  Strike: {strike_str} | Spot: {spot_str} (1m Vel: {vel:+.2f}%)\n"
-                f"  Spread: {spread_cents} cents | Orderbook Depth: {ob_ratio_pct}% YES\n"
-                f"  Forecast: {prediction}\n"
-                f"  Note: {rationale}\n\n"
-            )
-
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.error(f"Error in analyze_command: {e}")
-
-async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = context.job.chat_id
-        markets = fetch_15m_crypto_markets()
-        if not markets:
-            return
-
-        if "alerted" not in context.bot_data:
-            context.bot_data["alerted"] = set()
-
-        cache_spot = {}
-        cache_vel = {}
-        cache_ob = {}
-        
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            spot_futures = {executor.submit(get_live_spot_price, coin): coin for coin in SERIES_MAPPING.keys()}
-            ob_futures = {executor.submit(fetch_kalshi_orderbook_imbalance, m["ticker"]): m["ticker"] for m in markets}
-            
-            for future in as_completed(spot_futures):
-                coin = spot_futures[future]
-                try:
-                    cache_spot[coin] = future.result()
-                    cache_vel[coin] = get_spot_velocity(coin)
-                except Exception:
-                    cache_spot[coin] = None
-                    cache_vel[coin] = 0.0
-
-            for future in as_completed(ob_futures):
-                ticker = ob_futures[future]
-                try:
-                    cache_ob[ticker] = future.result()
-                except Exception:
-                    cache_ob[ticker] = {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
-
-        valid_vels = [v for v in cache_vel.values() if v != 0.0]
-        avg_velocity = sum(valid_vels) / len(valid_vels) if valid_vels else 0.0
-
-        for m in markets:
-            coin = m["coin"]
-            ticker = m["ticker"]
-            strike = m["strike"]
-            yes_bid = m["yes_bid"] if isinstance(m["yes_bid"], (int, float)) else 0.5
-            yes_ask = m["yes_ask"] if isinstance(m["yes_ask"], (int, float)) else 0.5
-            secs_left = get_seconds_left(m["close_time"])
-            
-            if not isinstance(strike, (int, float)):
-                continue
-
-            spot = cache_spot.get(coin)
-            vel = cache_vel.get(coin, 0.0)
-            if spot is None:
-                continue
-
-            spread = abs(yes_ask - yes_bid)
-            prediction, _ = evaluate_forward_prediction(
-                coin, spot, strike, yes_bid, yes_ask, vel, cache_ob.get(ticker, {}).get("ratio", 0.5), secs_left, avg_velocity
-            )
-            yes_cents = int(yes_bid * 100)
-            ob_ratio_pct = int(cache_ob.get(ticker, {}).get("ratio", 0.5) * 100)
-
-            if secs_left <= 90 and secs_left > 0 and spread <= 0.08:
-                if prediction == "YES" and yes_cents <= 75:
-                    key = f"{ticker}_FINAL90_YES"
-                    if key not in context.bot_data["alerted"]:
-                        context.bot_data["alerted"].add(key)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"FINAL 90S BUY YES ALERT [{coin}]\n"
-                                f"Ticker: {ticker}\n"
-                                f"Time Left: {secs_left}s\n"
-                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
-                                f"Velocity: {vel:+.2f}% | Orderbook: {ob_ratio_pct}% YES\n"
-                                f"Yes Price: {yes_cents} cents (Safe Buffer & Momentum Aligned!)"
-                            )
-                        )
-                elif prediction == "NO" and yes_cents >= 25:
-                    key = f"{ticker}_FINAL90_NO"
-                    if key not in context.bot_data["alerted"]:
-                        context.bot_data["alerted"].add(key)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"FINAL 90S BUY NO ALERT [{coin}]\n"
-                                f"Ticker: {ticker}\n"
-                                f"Time Left: {secs_left}s\n"
-                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
-                                f"Velocity: {vel:+.2f}% | Orderbook: {ob_ratio_pct}% YES\n"
-                                f"Yes Price: {yes_cents} cents (Safe Buffer & Momentum Aligned!)"
-                            )
-                        )
-    except Exception as e:
-        logger.error(f"Error in monitor_job: {e}")
-
-async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = update.effective_chat.id
-        for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-            job.schedule_removal()
-        context.job_queue.run_repeating(monitor_job, interval=15, first=1, chat_id=chat_id, name=str(chat_id))
-        await update.message.reply_text("Final 90-Second Expiry Alerts Enabled!")
-    except Exception as e:
-        logger.error(f"Error in start_alerts: {e}")
-
-async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        chat_id = update.effective_chat.id
-        jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-        if not jobs:
-            await update.message.reply_text("No alerts running.")
-            return
-        for j in jobs:
-            j.schedule_removal()
-        await update.message.reply_text("Alerts stopped.")
-    except Exception as e:
-        logger.error(f"Error in stop_alerts: {e}")
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-
-def main():
-    if not BOT_TOKEN:
-        logger.error("FATAL: Missing BOT_TOKEN environment variable!")
-        return
-
-    logger.info(f"Initiating health check web server on port {PORT}...")
-    server_thread = threading.Thread(target=start_health_check_server, daemon=True)
-    server_thread.start()
-
-    logger.info("Initializing Telegram application...")
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("fetchstrikes", fetch_strikes_command))
-    app.add_handler(CommandHandler("analyze", analyze_command))
-    app.add_handler(CommandHandler("startalerts", start_alerts))
-    app.add_handler(CommandHandler("stopalerts", stop_alerts))
-    
-    app.add_error_handler(error_handler)
-
-    logger.info("Bot started successfully. Listening for updates...")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+    prices = [p[1] for p in history]
+    returns = []
+    for i in range(1, len(
