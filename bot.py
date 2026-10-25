@@ -1,5 +1,6 @@
 import os
 import logging
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from kalshi_python_sync import KalshiClient
@@ -12,11 +13,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 KALSHI_KEY_ID = os.getenv("KALSHI_KEY_ID")
 KALSHI_PRIVATE_KEY_PEM = os.getenv("KALSHI_PRIVATE_KEY")
 
-# Initialize Official Kalshi Client (Environment or Demo mode)
-# If using production, base_url defaults to production exchange API
+# Initialize Official Kalshi Client
 try:
     if KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PEM:
-        # Format key properly if newline issues occurred in Render env vars
+        # Handle formatting if newlines were escaped as literal '\n' in Render env vars
         formatted_key = KALSHI_PRIVATE_KEY_PEM.replace("\\n", "\n")
         kalshi_client = KalshiClient(
             key_id=KALSHI_KEY_ID,
@@ -39,10 +39,8 @@ INDEX_MAPPING = {
 }
 
 def fetch_15m_crypto_markets():
-    """Fetches active 15-minute crypto markets using Kalshi public or authenticated endpoints"""
+    """Fetches active 15-minute crypto markets from Kalshi public API"""
     try:
-        # Markets endpoint is public and does not strictly require auth for listing open contracts
-        import requests
         resp = requests.get(
             "https://external-api.kalshi.com/trade-api/v2/markets",
             params={"status": "open", "limit": 100},
@@ -86,7 +84,6 @@ def get_cf_index(index_id: str):
     if not kalshi_client:
         return None
     try:
-        # Using SDK CF Benchmark passthrough request
         res = kalshi_client.get(f"/trade-api/v2/cfbenchmarks/values?id={index_id}")
         payload = res.get("data", {}).get("payload", {})
         val = payload.get("val")
@@ -96,7 +93,7 @@ def get_cf_index(index_id: str):
         logger.error(f"Error pulling CF benchmark for {index_id}: {e}")
         return None
 
-# --- Telegram Commands ---
+# --- Telegram Command Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -227,7 +224,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("fetchstrikes", fetchstrikes_command))
+    app.add_handler(CommandHandler("fetchstrikes", fetch_strikes_command))
     app.add_handler(CommandHandler("analyze", analyze_command))
     app.add_handler(CommandHandler("startalerts", start_alerts))
     app.add_handler(CommandHandler("stopalerts", stop_alerts))
