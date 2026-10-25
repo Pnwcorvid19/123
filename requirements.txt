@@ -1,3 +1,2 @@
-kalshi-python-sync
 python-telegram-bot[job-queue]
 requests
