@@ -3,6 +3,7 @@ import time
 import logging
 import datetime
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -28,50 +29,58 @@ SERIES_MAPPING = {
 # Cache for spot velocity tracking
 SPOT_HISTORY = {}
 
-def fetch_15m_crypto_markets():
-    """Fetches active 15-minute crypto markets for all supported coins from Kalshi"""
+def fetch_single_market(coin, series_ticker):
     results = []
-    for coin, series_ticker in SERIES_MAPPING.items():
-        try:
-            resp = requests.get(
-                f"{KALSHI_BASE_URL}/trade-api/v2/markets",
-                params={"series_ticker": series_ticker, "status": "open"},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                markets = resp.json().get("markets", [])
-                for m in markets:
-                    ticker = str(m.get("ticker", "")).upper()
-                    title = str(m.get("title", ""))
-                    strike = m.get("floor_strike") or m.get("strike_price") or m.get("cap_strike")
-                    close_time_str = m.get("close_time")
-                    
-                    yes_bid = m.get("yes_bid_dollars") or m.get("yes_bid")
-                    yes_ask = m.get("yes_ask_dollars") or m.get("yes_ask")
-                    
-                    if isinstance(yes_bid, (int, float)) and yes_bid > 1.0:
-                        yes_bid = yes_bid / 100.0
-                    if isinstance(yes_ask, (int, float)) and yes_ask > 1.0:
-                        yes_ask = yes_ask / 100.0
+    try:
+        resp = requests.get(
+            f"{KALSHI_BASE_URL}/trade-api/v2/markets",
+            params={"series_ticker": series_ticker, "status": "open"},
+            timeout=4
+        )
+        if resp.status_code == 200:
+            markets = resp.json().get("markets", [])
+            for m in markets:
+                ticker = str(m.get("ticker", "")).upper()
+                title = str(m.get("title", ""))
+                strike = m.get("floor_strike") or m.get("strike_price") or m.get("cap_strike")
+                close_time_str = m.get("close_time")
+                
+                yes_bid = m.get("yes_bid_dollars") or m.get("yes_bid")
+                yes_ask = m.get("yes_ask_dollars") or m.get("yes_ask")
+                
+                if isinstance(yes_bid, (int, float)) and yes_bid > 1.0:
+                    yes_bid = yes_bid / 100.0
+                if isinstance(yes_ask, (int, float)) and yes_ask > 1.0:
+                    yes_ask = yes_ask / 100.0
 
-                    results.append({
-                        "coin": coin,
-                        "ticker": ticker,
-                        "title": title,
-                        "strike": strike,
-                        "close_time": close_time_str,
-                        "yes_bid": yes_bid,
-                        "yes_ask": yes_ask
-                    })
-        except Exception as e:
-            logger.error(f"Error fetching markets for {series_ticker}: {e}")
-            
+                results.append({
+                    "coin": coin,
+                    "ticker": ticker,
+                    "title": title,
+                    "strike": strike,
+                    "close_time": close_time_str,
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask
+                })
+    except Exception as e:
+        logger.error(f"Error fetching markets for {series_ticker}: {e}")
+    return results
+
+def fetch_15m_crypto_markets():
+    """Fetches active 15-minute crypto markets concurrently across all coins"""
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_single_market, coin, ticker): coin for coin, ticker in SERIES_MAPPING.items()}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                results.extend(res)
     return results
 
 def fetch_kalshi_orderbook_imbalance(ticker: str) -> dict:
     """Queries Kalshi's public order book to measure YES vs NO depth imbalance and spread"""
     try:
-        resp = requests.get(f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}/orderbook", timeout=3)
+        resp = requests.get(f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}/orderbook", timeout=2)
         if resp.status_code == 200:
             data = resp.json().get("orderbook", {})
             yes_orders = data.get("yes", [])
@@ -100,7 +109,7 @@ def get_live_spot_price(coin: str):
         }
         cg_id = cg_ids.get(coin)
         if cg_id:
-            resp = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=3)
+            resp = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd", timeout=2)
             if resp.status_code == 200:
                 val = resp.json().get(cg_id, {}).get("usd")
                 if val:
@@ -118,7 +127,7 @@ def get_live_spot_price(coin: str):
             }
             symbol = cb_symbols.get(coin)
             if symbol:
-                resp = requests.get(f"https://api.coinbase.com/v2/prices/{symbol}/spot", timeout=3)
+                resp = requests.get(f"https://api.coinbase.com/v2/prices/{symbol}/spot", timeout=2)
                 if resp.status_code == 200:
                     val = resp.json().get("data", {}).get("amount")
                     if val:
@@ -136,7 +145,7 @@ def get_live_spot_price(coin: str):
             }
             cc_id = cc_ids.get(coin)
             if cc_id:
-                resp = requests.get(f"https://api.coincap.io/v2/assets/{cc_id}", timeout=3)
+                resp = requests.get(f"https://api.coincap.io/v2/assets/{cc_id}", timeout=2)
                 if resp.status_code == 200:
                     val = resp.json().get("data", {}).get("priceUsd")
                     if val:
@@ -150,7 +159,6 @@ def get_live_spot_price(coin: str):
         if coin not in SPOT_HISTORY:
             SPOT_HISTORY[coin] = []
         SPOT_HISTORY[coin].append((now, current_price))
-        # Keep only last 5 minutes of history
         SPOT_HISTORY[coin] = [p for p in SPOT_HISTORY[coin] if now - p[0] <= 300]
 
     return current_price
@@ -221,10 +229,17 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_spot = {}
     cache_vel = {}
     
-    # 1. Gather Spot & Velocity
-    for coin in SERIES_MAPPING.keys():
-        cache_spot[coin] = get_live_spot_price(coin)
-        cache_vel[coin] = get_spot_velocity(coin)
+    # 1. Gather Spot & Velocity concurrently
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        spot_futures = {executor.submit(get_live_spot_price, coin): coin for coin in SERIES_MAPPING.keys()}
+        for future in as_completed(spot_futures):
+            coin = spot_futures[future]
+            try:
+                cache_spot[coin] = future.result()
+                cache_vel[coin] = get_spot_velocity(coin)
+            except Exception:
+                cache_spot[coin] = None
+                cache_vel[coin] = 0.0
 
     # 2. Market Beta Check
     valid_vels = [v for v in cache_vel.values() if v != 0.0]
@@ -233,7 +248,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for m in markets[:10]:
         coin = m['coin']
         ticker = m['ticker']
-        spot = cache_spot[coin]
+        spot = cache_spot.get(coin)
         strike = m['strike']
         yes_bid = m['yes_bid'] or 0.5
         yes_ask = m['yes_ask'] or 0.5
@@ -242,7 +257,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Order Book Analysis
         ob = fetch_kalshi_orderbook_imbalance(ticker)
-        vel = cache_vel[coin]
+        vel = cache_vel.get(coin, 0.0)
         spread = abs(yes_ask - yes_bid)
         
         prediction = "PENDING"
@@ -312,9 +327,16 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
 
     cache_spot = {}
     cache_vel = {}
-    for coin in SERIES_MAPPING.keys():
-        cache_spot[coin] = get_live_spot_price(coin)
-        cache_vel[coin] = get_spot_velocity(coin)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        spot_futures = {executor.submit(get_live_spot_price, coin): coin for coin in SERIES_MAPPING.keys()}
+        for future in as_completed(spot_futures):
+            coin = spot_futures[future]
+            try:
+                cache_spot[coin] = future.result()
+                cache_vel[coin] = get_spot_velocity(coin)
+            except Exception:
+                cache_spot[coin] = None
+                cache_vel[coin] = 0.0
 
     for m in markets:
         coin = m['coin']
@@ -327,8 +349,8 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
         if not isinstance(strike, (int, float)):
             continue
 
-        spot = cache_spot[coin]
-        vel = cache_vel[coin]
+        spot = cache_spot.get(coin)
+        vel = cache_vel.get(coin, 0.0)
         if not spot:
             continue
 
@@ -341,66 +363,4 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
             
             if spot > strike and yes_cents <= 65 and vel >= 0 and ob['ratio'] >= 0.50:
                 key = f"{ticker}_MULTI_YES"
-                if key not in context.bot_data["alerted"]:
-                    context.bot_data["alerted"].add(key)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"🚨 **MULTI-FACTOR BUY YES ALERT [{coin}]** 🚨\n"
-                            f"`{ticker}`\n"
-                            f"⏳ Time Left: {secs_left}s\n"
-                            f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f} (+${diff:.4f})\n"
-                            f"1m Velocity: `{vel:+.2f}%` | Orderbook: `{int(ob['ratio']*100)}% YES`\n"
-                            f"Yes Price: **{yes_cents}¢** (Underpriced Edge!)"
-                        )
-                    )
-            elif spot < strike and yes_cents >= 35 and vel <= 0 and ob['ratio'] <= 0.50:
-                key = f"{ticker}_MULTI_NO"
-                if key not in context.bot_data["alerted"]:
-                    context.bot_data["alerted"].add(key)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"🚨 **MULTI-FACTOR BUY NO ALERT [{coin}]** 🚨\n"
-                            f"`{ticker}`\n"
-                            f"⏳ Time Left: {secs_left}s\n"
-                            f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f} (-${abs(diff):.4f})\n"
-                            f"1m Velocity: `{vel:+.2f}%` | Orderbook: `{int(ob['ratio']*100)}% YES`\n"
-                            f"Yes Price: **{yes_cents}¢** (Overpriced Edge!)"
-                        )
-                    )
-
-async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-        job.schedule_removal()
-    context.job_queue.run_repeating(monitor_job, interval=20, first=1, chat_id=chat_id, name=str(chat_id))
-    await update.message.reply_text("🚨 **Multi-Factor Prediction Alerts Enabled for All 8 Coins!**")
-
-async def stop_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
-    if not jobs:
-        await update.message.reply_text("ℹ️ No alerts running.")
-        return
-    for j in jobs:
-        j.schedule_removal()
-    await update.message.reply_text("🛑 **Alerts stopped.**")
-
-def main():
-    if not BOT_TOKEN:
-        raise ValueError("Missing BOT_TOKEN environment variable!")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("fetchstrikes", fetch_strikes_command))
-    app.add_handler(CommandHandler("analyze", analyze_command))
-    app.add_handler(CommandHandler("startalerts", start_alerts))
-    app.add_handler(CommandHandler("stopalerts", stop_alerts))
-
-    logger.info("Starting bot polling...")
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
+                if key not in context.bot_
