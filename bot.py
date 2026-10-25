@@ -226,13 +226,57 @@ def get_seconds_left(close_time_str: str) -> int:
     except Exception:
         return 9999
 
+def evaluate_forward_prediction(spot, strike, yes_bid, yes_ask, vel, ob_ratio, secs_left, avg_market_beta):
+    if spot is None or not isinstance(strike, (int, float)) or strike <= 0:
+        return "PENDING", "Insufficient market data for forecasting."
+        
+    diff = spot - strike
+    pct_diff = (diff / strike) * 100
+    yes_cents = int(yes_bid * 100) if isinstance(yes_bid, (int, float)) else 50
+    spread = abs(yes_ask - yes_bid) if isinstance(yes_ask, (int, float)) and isinstance(yes_bid, (int, float)) else 0.05
+    mins_left = secs_left // 60
+    
+    # Forward-Looking Trajectory Score Calculation
+    momentum_bias = vel * 2.5       # Velocity momentum weight
+    depth_bias = (ob_ratio - 0.5) * 3.0  # Orderbook imbalance weight
+    beta_bias = 0.4 if avg_market_beta > 0 else -0.4
+    
+    if secs_left <= 180: # Final 3 minutes: Current position heavily dictates expiry outcome
+        if diff > 0:
+            score = 4.0 + (pct_diff * 80) + momentum_bias
+        else:
+            score = -4.0 + (pct_diff * 80) + momentum_bias
+    else: # > 3 minutes left: Momentum and orderbook depth drive the forward projection
+        score = (pct_diff * 40) + (momentum_bias * 2.5) + (depth_bias * 2.0) + beta_bias
+        
+    prediction = "PENDING"
+    rationale = ""
+    
+    if score > 0.6:
+        prediction = "YES 🟢"
+        if secs_left <= 300 and yes_cents <= 70 and spread <= 0.08:
+            rationale = f"**PROJECTED ABOVE STRIKE** (+${diff:.4f}, {mins_left}m left). Vel: `{vel:+.2f}%`, OB: `{int(ob_ratio*100)}% YES`. **HIGH EDGE BUY YES at {yes_cents}¢**"
+        else:
+            rationale = f"Bullish trajectory toward expiry | Spot +${diff:.4f} above strike | Vel: `{vel:+.2f}%`, OB: `{int(ob_ratio*100)}% YES`"
+    elif score < -0.6:
+        prediction = "NO 🔴"
+        if secs_left <= 300 and yes_cents >= 30 and spread <= 0.08:
+            rationale = f"**PROJECTED BELOW STRIKE** (-${abs(diff):.4f}, {mins_left}m left). Vel: `{vel:+.2f}%`, OB: `{int(ob_ratio*100)}% YES`. **HIGH EDGE BUY NO / YES is {yes_cents}¢**"
+        else:
+            rationale = f"Bearish trajectory toward expiry | Spot -${abs(diff):.4f} below strike | Vel: `{vel:+.2f}%`, OB: `{int(ob_ratio*100)}% YES`"
+    else:
+        prediction = "TOSS-UP ⚪"
+        rationale = f"High volatility / Zone boundary | Diff: ${diff:+.4f} | Vel: `{vel:+.2f}%`, OB: `{int(ob_ratio*100)}% YES`"
+        
+    return prediction, rationale
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(
             "🤖 **Crypto Multi-Factor Prediction Bot Active**\n\n"
             "Commands:\n"
             "• `/fetchstrikes` - View active 15m contracts & strikes\n"
-            "• `/analyze` - Run multi-factor YES/NO predictions\n"
+            "• `/analyze` - Run forward-looking trajectory predictions\n"
             "• `/startalerts` - Turn on background alerts\n"
             "• `/stopalerts` - Turn off alerts"
         )
@@ -267,7 +311,7 @@ async def fetch_strikes_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text("🔍 Analyzing spot velocity, orderbook depth, spreads, and market beta across all coins...")
+        await update.message.reply_text("🔍 Analyzing forward trajectory, velocity momentum, and orderbook depth across all coins...")
         markets = fetch_15m_crypto_markets()
         if not markets:
             await update.message.reply_text("⚠️ No active 15-minute markets found.")
@@ -302,7 +346,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         valid_vels = [v for v in cache_vel.values() if v != 0.0]
         avg_velocity = sum(valid_vels) / len(valid_vels) if valid_vels else 0.0
 
-        msg = "📊 **Multi-Factor Prediction & Market Depth Analysis**\n\n"
+        msg = "📊 **Forward-Looking Expiry Forecast & Analysis**\n\n"
         
         for m in active_markets:
             coin = m["coin"]
@@ -313,51 +357,14 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             yes_bid = m["yes_bid"] if isinstance(m["yes_bid"], (int, float)) else 0.5
             yes_ask = m["yes_ask"] if isinstance(m["yes_ask"], (int, float)) else 0.5
             secs_left = get_seconds_left(m["close_time"])
-            mins_left = secs_left // 60
             
             ob = cache_ob.get(ticker, {"ratio": 0.5})
             vel = cache_vel.get(coin, 0.0)
             spread = abs(yes_ask - yes_bid)
             
-            prediction = "PENDING"
-            rationale = "Insufficient data"
-            
-            if spot is not None and isinstance(strike, (int, float)):
-                diff = spot - strike
-                yes_cents = int(yes_bid * 100)
-                
-                if spot > strike:
-                    prediction = "YES 🟢"
-                    factors = []
-                    if vel > 0.05:
-                        factors.append("🚀 Strong Positive Velocity")
-                    if ob["ratio"] > 0.55:
-                        factors.append("🛡️ YES Orderbook Support")
-                    if avg_velocity > 0:
-                        factors.append("🌐 Positive Market Beta")
-                    
-                    factor_str = " | ".join(factors) if factors else "Spot holds above strike"
-                    
-                    if secs_left <= 300 and yes_cents <= 70 and spread <= 0.08:
-                        rationale = f"Spot +${diff:.4f} above strike with {mins_left}m left. **HIGH CONFIDENCE BUY YES at {yes_cents}¢** ({factor_str})"
-                    else:
-                        rationale = f"Spot +${diff:.4f} above strike ({mins_left}m left) | {factor_str}"
-                else:
-                    prediction = "NO 🔴"
-                    factors = []
-                    if vel < -0.05:
-                        factors.append("📉 Negative Velocity")
-                    if ob["ratio"] < 0.45:
-                        factors.append("🧱 Heavy NO Wall")
-                    if avg_velocity < 0:
-                        factors.append("🌐 Negative Market Beta")
-                    
-                    factor_str = " | ".join(factors) if factors else "Spot sits below strike"
-                    
-                    if secs_left <= 300 and yes_cents >= 30 and spread <= 0.08:
-                        rationale = f"Spot -${abs(diff):.4f} below strike with {mins_left}m left. **HIGH CONFIDENCE BUY NO / YES is {yes_cents}¢** ({factor_str})"
-                    else:
-                        rationale = f"Spot -${abs(diff):.4f} below strike ({mins_left}m left) | {factor_str}"
+            prediction, rationale = evaluate_forward_prediction(
+                spot, strike, yes_bid, yes_ask, vel, ob["ratio"], secs_left, avg_velocity
+            )
 
             spot_str = f"${spot:,.4f}" if spot is not None else "Unavailable"
             strike_str = f"${strike:,.4f}" if isinstance(strike, (int, float)) else "N/A"
@@ -368,7 +375,7 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• **[{coin}] {title}**\n"
                 f"  Strike: **{strike_str}** | Spot: **{spot_str}** (1m Vel: `{vel:+.2f}%`)\n"
                 f"  Spread: **{spread_cents}¢** | Orderbook Depth: **{ob_ratio_pct}% YES**\n"
-                f"  🔮 **Prediction: {prediction}**\n"
+                f"  🔮 **Forecast: {prediction}**\n"
                 f"  📝 *{rationale}*\n\n"
             )
 
@@ -410,6 +417,9 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     cache_ob[ticker] = {"yes_vol": 0, "no_vol": 0, "ratio": 0.5}
 
+        valid_vels = [v for v in cache_vel.values() if v != 0.0]
+        avg_velocity = sum(valid_vels) / len(valid_vels) if valid_vels else 0.0
+
         for m in markets:
             coin = m["coin"]
             ticker = m["ticker"]
@@ -426,42 +436,42 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE):
             if spot is None:
                 continue
 
-            diff = spot - strike
-            yes_cents = int(yes_bid * 100)
             spread = abs(yes_ask - yes_bid)
+            prediction, _ = evaluate_forward_prediction(
+                spot, strike, yes_bid, yes_ask, vel, cache_ob.get(ticker, {}).get("ratio", 0.5), secs_left, avg_velocity
+            )
+            yes_cents = int(yes_bid * 100)
+            ob_ratio_pct = int(cache_ob.get(ticker, {}).get("ratio", 0.5) * 100)
 
             if secs_left <= 300 and secs_left > 0 and spread <= 0.08:
-                ob = cache_ob.get(ticker, {"ratio": 0.5})
-                ob_ratio_pct = int(ob["ratio"] * 100)
-                
-                if spot > strike and yes_cents <= 65 and vel >= 0 and ob["ratio"] >= 0.50:
-                    key = f"{ticker}_MULTI_YES"
+                if prediction == "YES 🟢" and yes_cents <= 65:
+                    key = f"{ticker}_FORWARD_YES"
                     if key not in context.bot_data["alerted"]:
                         context.bot_data["alerted"].add(key)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"🚨 **MULTI-FACTOR BUY YES ALERT [{coin}]** 🚨\n"
+                                f"🚨 **EXPIRY FORECAST: BUY YES [{coin}]** 🚨\n"
                                 f"`{ticker}`\n"
                                 f"⏳ Time Left: {secs_left}s\n"
-                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f} (+${diff:.4f})\n"
-                                f"1m Velocity: `{vel:+.2f}%` | Orderbook: `{ob_ratio_pct}% YES`\n"
-                                f"Yes Price: **{yes_cents}¢** (Underpriced Edge!)"
+                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
+                                f"Velocity: `{vel:+.2f}%` | Orderbook: `{ob_ratio_pct}% YES`\n"
+                                f"Yes Price: **{yes_cents}¢** (Projected to clear strike!)"
                             )
                         )
-                elif spot < strike and yes_cents >= 35 and vel <= 0 and ob["ratio"] <= 0.50:
-                    key = f"{ticker}_MULTI_NO"
+                elif prediction == "NO 🔴" and yes_cents >= 35:
+                    key = f"{ticker}_FORWARD_NO"
                     if key not in context.bot_data["alerted"]:
                         context.bot_data["alerted"].add(key)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"🚨 **MULTI-FACTOR BUY NO ALERT [{coin}]** 🚨\n"
+                                f"🚨 **EXPIRY FORECAST: BUY NO [{coin}]** 🚨\n"
                                 f"`{ticker}`\n"
                                 f"⏳ Time Left: {secs_left}s\n"
-                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f} (-${abs(diff):.4f})\n"
-                                f"1m Velocity: `{vel:+.2f}%` | Orderbook: `{ob_ratio_pct}% YES`\n"
-                                f"Yes Price: **{yes_cents}¢** (Overpriced Edge!)"
+                                f"Strike: ${strike:,.4f} | Spot: ${spot:,.4f}\n"
+                                f"Velocity: `{vel:+.2f}%` | Orderbook: `{ob_ratio_pct}% YES`\n"
+                                f"Yes Price: **{yes_cents}¢** (Projected to finish below strike!)"
                             )
                         )
     except Exception as e:
@@ -473,7 +483,7 @@ async def start_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for job in context.job_queue.get_jobs_by_name(str(chat_id)):
             job.schedule_removal()
         context.job_queue.run_repeating(monitor_job, interval=20, first=1, chat_id=chat_id, name=str(chat_id))
-        await update.message.reply_text("🚨 **Multi-Factor Prediction Alerts Enabled!**")
+        await update.message.reply_text("🚨 **Forward-Looking Expiry Alerts Enabled!**")
     except Exception as e:
         logger.error(f"Error in start_alerts: {e}")
 
