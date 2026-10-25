@@ -42,20 +42,24 @@ MIN_BUFFERS = {
 
 SPOT_HISTORY = {}
 
-def run_dummy_web_server():
+def start_health_check_server():
+    """Starts an HTTP server on 0.0.0.0:PORT so Render Web Service passes health checks."""
     class HealthCheckHandler(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
+            self.send_header("Content-type", "text/plain")
             self.end_headers()
-            self.wfile.write(b"Bot is active and running!")
+            self.wfile.write(b"OK")
+            
         def log_message(self, format, *args):
-            pass
+            pass  # Suppress HTTP health log spam
 
     try:
         server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
+        logger.info(f"Health check HTTP server successfully bound on port {PORT}")
         server.serve_forever()
     except Exception as e:
-        logger.error(f"Web server error: {e}")
+        logger.error(f"Failed to bind web server on port {PORT}: {e}")
 
 def fetch_single_market(coin, series_ticker):
     results = []
@@ -85,37 +89,4 @@ def fetch_single_market(coin, series_ticker):
                 raw_yes_ask = m.get("yes_ask_dollars") or m.get("yes_ask")
                 
                 yes_bid = 0.5
-                if raw_yes_bid is not None:
-                    try:
-                        val = float(raw_yes_bid)
-                        yes_bid = val / 100.0 if val > 1.0 else val
-                    except (ValueError, TypeError):
-                        pass
-
-                yes_ask = 0.5
-                if raw_yes_ask is not None:
-                    try:
-                        val = float(raw_yes_ask)
-                        yes_ask = val / 100.0 if val > 1.0 else val
-                    except (ValueError, TypeError):
-                        pass
-
-                results.append({
-                    "coin": coin,
-                    "ticker": ticker,
-                    "title": title,
-                    "strike": strike,
-                    "close_time": close_time_str,
-                    "yes_bid": yes_bid,
-                    "yes_ask": yes_ask
-                })
-    except Exception as e:
-        logger.error(f"Error fetching markets for {series_ticker}: {e}")
-    return results
-
-def fetch_15m_crypto_markets():
-    results = []
-    try:
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(fetch_single_market, coin, ticker): coin for coin, ticker in SERIES_MAPPING.items()}
-            for
+                if
